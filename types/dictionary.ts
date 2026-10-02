@@ -55,6 +55,10 @@ export interface VersionRecord {
   action: string;
   detail: string;
   entryId?: string;
+  /** 该版本对应的修订号（提交前的修订），用于压缩后重算撤销重做。 */
+  revision?: number;
+  /** 编辑标记的关键版本：压缩存储时优先保留。 */
+  pinned?: boolean;
   before: DictionaryEntry[];
 }
 

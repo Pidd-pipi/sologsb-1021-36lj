@@ -4,6 +4,10 @@ import type {
   AuditRecord, DictionaryEntry, DictionarySnapshot, DuplicatePair, EntryStatus, ReviewComment, VersionRecord
 } from '~/types/dictionary';
 import { findDuplicates } from '~/utils/dictionary';
+import {
+  STORAGE_BUDGET_BYTES, STORAGE_KEY, clearStoredSnapshot, estimateBytes,
+  readStoredSnapshot, writeStoredSnapshot, type WriteResult
+} from '~/utils/storage';
 
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now().toString(36)}`;
@@ -53,6 +57,26 @@ const seedAudit: AuditRecord[] = [{
   id: 'audit-seed', at: now(), action: '载入工作区', detail: '初始化 6 个词条、2 条待回复审校意见和 1 组疑似重复词条', entryIds: []
 }];
 
+export interface CommitResult {
+  ok: boolean;
+  reason?: 'quota' | 'conflict';
+  evicted?: number;
+}
+
+export interface FailedCommit {
+  action: string;
+  detail: string;
+  entryIds: string[];
+  mutation: () => void;
+  at: string;
+}
+
+export interface StorageError {
+  type: 'quota' | 'conflict' | 'error';
+  message: string;
+  at: string;
+}
+
 export const useDictionaryStore = defineStore('dictionary', () => {
   const revision = ref(1);
   const entries = reactive<DictionaryEntry[]>(seedEntries());
@@ -66,6 +90,15 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   const statusFilter = ref<EntryStatus | 'all'>('all');
   const dialectFilter = ref('all');
   const fieldReplyDrafts = reactive<Record<string, string>>({});
+
+  // 存储预算与跨标签页状态
+  const storageBudget = STORAGE_BUDGET_BYTES;
+  const storageUsed = ref(0);
+  const lastSeenRevision = ref(1);
+  const lastError = ref<StorageError | null>(null);
+  const conflictRevision = ref<number | null>(null);
+  const selectedVersionId = ref<string | null>(null);
+  const failedCommit = ref<FailedCommit | null>(null);
 
   const selectedEntry = computed(() => entries.find((entry) => entry.id === selectedId.value) ?? entries[0]);
   const persistableSnapshot = computed<DictionarySnapshot>(() => ({
@@ -87,6 +120,8 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     });
   });
   const dialects = computed(() => [...new Set(entries.flatMap((entry) => entry.dialectVariants.map((variant) => variant.dialect)))].sort());
+  const storageRatio = computed(() => Math.min(1, storageUsed.value / storageBudget));
+  const overBudget = computed(() => storageUsed.value > storageBudget);
 
   function snapshot(): DictionarySnapshot {
     return {
@@ -103,27 +138,125 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     versions.splice(0, versions.length, ...(clone(value.versions ?? [])));
     audit.splice(0, audit.length, ...(clone(value.audit ?? [])));
     if (!entries.some((entry) => entry.id === selectedId.value)) selectedId.value = entries[0]?.id ?? '';
+    if (selectedVersionId.value && !versions.some((version) => version.id === selectedVersionId.value)) {
+      selectedVersionId.value = null;
+    }
   }
 
-  function commit(action: string, detail: string, entryIds: string[], mutation: () => void) {
+  /** 压缩存储：丢弃未固定的旧快照，保留最早恢复点与编辑标记的关键版本。返回丢弃条数。 */
+  function compressVersions(): number {
+    let evicted = 0;
+    // versions 按最新在前排列，最旧的一条即最早恢复点，必须保留
+    const earliest = versions[versions.length - 1];
+    const protectedIds = new Set<string>();
+    if (earliest) protectedIds.add(earliest.id);
+    versions.forEach((version) => { if (version.pinned) protectedIds.add(version.id); });
+
+    // 从最旧的未固定快照开始丢弃，直到体积回到预算内
+    for (let i = versions.length - 1; i >= 0; i--) {
+      if (estimateBytes(persistableSnapshot.value) <= storageBudget) break;
+      const version = versions[i];
+      if (!version || protectedIds.has(version.id)) continue;
+      versions.splice(i, 1);
+      evicted += 1;
+    }
+
+    recalcAfterCompression();
+    return evicted;
+  }
+
+  /** 压缩后重新计算时间线、撤销重做与已选版本，避免悬空引用。 */
+  function recalcAfterCompression() {
+    if (selectedVersionId.value && !versions.some((version) => version.id === selectedVersionId.value)) {
+      selectedVersionId.value = null;
+    }
+    // 仅保留时间线中仍存在的修订对应的撤销重做快照
+    const retainedRevisions = new Set(
+      versions.map((version) => version.revision).filter((revision): revision is number => typeof revision === 'number')
+    );
+    undoStack.value = undoStack.value.filter((item) => retainedRevisions.has(item.revision));
+    redoStack.value = redoStack.value.filter((item) => retainedRevisions.has(item.revision));
+  }
+
+  /** 数量上限：丢弃最旧的未固定版本，但保留最早恢复点与编辑标记的关键版本。 */
+  function capVersions(limit: number) {
+    if (versions.length <= limit) return;
+    const earliest = versions[versions.length - 1];
+    const protectedIds = new Set<string>();
+    if (earliest) protectedIds.add(earliest.id);
+    versions.forEach((version) => { if (version.pinned) protectedIds.add(version.id); });
+    for (let i = versions.length - 1; i >= 0; i--) {
+      if (versions.length <= limit) break;
+      const version = versions[i];
+      if (!version || protectedIds.has(version.id)) continue;
+      versions.splice(i, 1);
+    }
+    recalcAfterCompression();
+  }
+
+  function commit(action: string, detail: string, entryIds: string[], mutation: () => void): CommitResult {
+    // 跨标签页冲突检查：存储中的修订号不能高于我们最近观察到的修订号，
+    // 否则另一标签页的新修订会被旧页面覆盖。
+    const stored = readStoredSnapshot();
+    if (stored && stored.revision > lastSeenRevision.value) {
+      conflictRevision.value = stored.revision;
+      lastError.value = { type: 'conflict', message: '另一标签页已保存更新的修订，为避免覆盖已拒绝本次提交', at: now() };
+      return { ok: false, reason: 'conflict' };
+    }
+
+    // 记录回滚点（含选中项与撤销重做栈）
+    const restorePoint = snapshot();
+    const before = restorePoint.entries;
+    const undoPoint = undoStack.value;
+    const redoPoint = redoStack.value;
+    const selectedPoint = selectedId.value;
+
+    // 应用变更（同步、原子）
     undoStack.value = [...undoStack.value.slice(-49), snapshot()];
     redoStack.value = [];
-    const before = clone(entries);
     mutation();
     revision.value += 1;
     entries.forEach((entry) => { if (entryIds.includes(entry.id)) entry.updatedAt = now(); });
-    versions.unshift({ id: uid('version'), at: now(), action, detail, entryId: entryIds[0], before });
-    versions.splice(120);
+    versions.unshift({
+      id: uid('version'), at: now(), action, detail, entryId: entryIds[0],
+      revision: restorePoint.revision, before, pinned: false
+    });
     audit.unshift({ id: uid('audit'), at: now(), action, detail, entryIds });
+
+    // 预算检查：先估算整份快照的 UTF-8 字节数
+    let evicted = 0;
+    if (estimateBytes(persistableSnapshot.value) > storageBudget) {
+      evicted = compressVersions();
+    }
+
+    if (estimateBytes(persistableSnapshot.value) > storageBudget) {
+      // 腾不出空间：整笔撤回，保留草稿与重试入口
+      undoStack.value = undoPoint;
+      redoStack.value = redoPoint;
+      selectedId.value = selectedPoint;
+      restore(restorePoint);
+      failedCommit.value = { action, detail, entryIds, mutation, at: now() };
+      lastError.value = { type: 'quota', message: '本地存储容量不足，已丢弃未固定旧快照并撤回本次提交', at: now() };
+      return { ok: false, reason: 'quota', evicted };
+    }
+
+    // 提交成功
+    capVersions(120);
     audit.splice(300);
+    lastSeenRevision.value = revision.value;
+    storageUsed.value = estimateBytes(persistableSnapshot.value);
+    failedCommit.value = null;
+    lastError.value = null;
+    return { ok: true, evicted };
   }
 
-  function createEntry() {
+  function createEntry(): CommitResult {
     const entry: DictionaryEntry = {
       id: uid('entry'), headword: '新词条', pronunciation: '', partOfSpeech: '', definition: '', dialectVariants: [], examples: [], sources: [], synonyms: [], status: 'draft', notes: '', createdAt: now(), updatedAt: now(), reviewerComments: []
     };
-    commit('新建词条', '创建草稿词条', [entry.id], () => entries.unshift(entry));
-    selectedId.value = entry.id;
+    const result = commit('新建词条', '创建草稿词条', [entry.id], () => entries.unshift(entry));
+    if (result.ok) selectedId.value = entry.id;
+    return result;
   }
 
   function updateField<K extends keyof DictionaryEntry>(entryId: string, field: K, value: DictionaryEntry[K], label = String(field)) {
@@ -295,12 +428,84 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     });
   }
 
+  function pinVersion(versionId: string) {
+    const version = versions.find((item) => item.id === versionId);
+    if (version) version.pinned = true;
+  }
+
+  function unpinVersion(versionId: string) {
+    const version = versions.find((item) => item.id === versionId);
+    if (version) version.pinned = false;
+  }
+
+  /** 手动压缩存储：丢弃未固定旧快照，保留最早恢复点与关键版本。 */
+  function compressStorage(): number {
+    const evicted = compressVersions();
+    persistSnapshot(persistableSnapshot.value);
+    storageUsed.value = estimateBytes(persistableSnapshot.value);
+    return evicted;
+  }
+
+  /** 容量不足撤回后，用保留的草稿重试入口重新提交。 */
+  function retryFailedCommit() {
+    const failed = failedCommit.value;
+    if (!failed) return;
+    failedCommit.value = null;
+    commit(failed.action, failed.detail, failed.entryIds, failed.mutation);
+  }
+
+  function dismissError() {
+    lastError.value = null;
+  }
+
+  function dismissConflict() {
+    conflictRevision.value = null;
+  }
+
+  /** 从浏览器存储重新载入（用于跨标签页冲突后覆盖本地状态）。 */
+  function reloadFromStorage() {
+    const stored = readStoredSnapshot();
+    if (stored) {
+      restore(stored);
+      undoStack.value = [];
+      redoStack.value = [];
+      lastSeenRevision.value = stored.revision;
+      conflictRevision.value = null;
+      lastError.value = null;
+      failedCommit.value = null;
+      storageUsed.value = estimateBytes(persistableSnapshot.value);
+    }
+  }
+
+  /** 持久化当前快照，带跨标签页冲突检查与配额回退。 */
+  function persistSnapshot(snapshot: DictionarySnapshot): WriteResult {
+    const stored = readStoredSnapshot();
+    if (stored && stored.revision > lastSeenRevision.value && stored.revision !== snapshot.revision) {
+      conflictRevision.value = stored.revision;
+      lastError.value = { type: 'conflict', message: '另一标签页已保存更新的修订，本次写入已跳过', at: now() };
+      return { ok: false, reason: 'conflict', message: '另一标签页已保存更新的修订' };
+    }
+    const result = writeStoredSnapshot(snapshot);
+    if (result.ok) {
+      lastSeenRevision.value = snapshot.revision;
+      storageUsed.value = estimateBytes(snapshot);
+    } else if (result.reason === 'quota') {
+      lastError.value = { type: 'quota', message: '本地存储写入失败：容量不足，请压缩存储或删除旧快照后重试', at: now() };
+    }
+    return result;
+  }
+
   function hydrateFromBrowser() {
     try {
-      const raw = localStorage.getItem('sologsb-1021-dictionary-v1');
-      if (raw) restore(JSON.parse(raw) as DictionarySnapshot);
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as DictionarySnapshot;
+        restore(parsed);
+        lastSeenRevision.value = parsed.revision ?? 1;
+        storageUsed.value = estimateBytes(persistableSnapshot.value);
+      }
     } catch {
-      localStorage.removeItem('sologsb-1021-dictionary-v1');
+      clearStoredSnapshot();
     } finally {
       hydrated.value = true;
     }
@@ -313,9 +518,13 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   return {
     revision, entries, versions, audit, selectedId, hydrated, query, statusFilter, dialectFilter, fieldReplyDrafts,
     selectedEntry, filteredEntries, dialects, duplicates, openComments, persistableSnapshot,
+    storageBudget, storageUsed, storageRatio, overBudget, lastError, conflictRevision,
+    selectedVersionId, failedCommit, lastSeenRevision,
     canUndo: computed(() => undoStack.value.length > 0), canRedo: computed(() => redoStack.value.length > 0),
     createEntry, updateField, setStatus, addVariant, updateVariant, removeVariant, addExample, updateExample, removeExample,
     addSource, updateSource, removeSource, setSynonyms, addComment, replyComment, toggleComment, deleteEntry, mergeEntries,
-    undo, redo, restoreVersion, hydrateFromBrowser, exportPackage
+    undo, redo, restoreVersion, pinVersion, unpinVersion, compressStorage, retryFailedCommit,
+    dismissError, dismissConflict, reloadFromStorage, persistSnapshot,
+    hydrateFromBrowser, exportPackage
   };
 });

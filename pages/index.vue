@@ -59,6 +59,12 @@ const moveEntry = (delta: number) => {
   if (next) store.selectedId = next.id;
 };
 
+const formatBytes = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+};
+
 const keyboard = (event: KeyboardEvent) => {
   const target = event.target as HTMLElement;
   const editing = /INPUT|TEXTAREA|SELECT/.test(target.tagName) || target.isContentEditable;
@@ -121,6 +127,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyboard));
 
     <footer class="footer-bar">
       <span>当前修订 r{{ store.revision }} · {{ store.hydrated ? '浏览器本地保存已启用' : '正在载入本地数据' }}</span>
+      <span class="storage-meter" :class="{ over: store.overBudget }" :title="`存储预算 ${formatBytes(store.storageUsed)} / ${formatBytes(store.storageBudget)}`">
+        <span class="storage-meter-bar"><span class="storage-meter-fill" :style="{ width: `${Math.round(store.storageRatio * 100)}%` }" /></span>
+        {{ formatBytes(store.storageUsed) }} / {{ formatBytes(store.storageBudget) }}
+      </span>
       <button v-if="store.selectedEntry" class="delete-link" @click="openDelete">删除当前词条并检查引用</button>
     </footer>
 
