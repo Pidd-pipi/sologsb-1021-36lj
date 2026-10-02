@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
+import { MessagePlugin } from 'tdesign-vue-next';
 import type { DuplicatePair, DictionaryEntry } from '~/types/dictionary';
 import { useDictionaryStore } from '~/store/dictionary';
 
@@ -27,10 +28,16 @@ watch(visible, (open) => {
   fields.forEach(([field]) => { choices[field] = 'target'; });
 });
 
-const confirmMerge = () => {
+const confirmMerge = async () => {
   if (!target.value || !source.value) return;
-  store.mergeEntries(target.value.id, [source.value.id], choices);
-  visible.value = false;
+  const ok = await store.mergeEntries(target.value.id, [source.value.id], choices);
+  if (ok) {
+    visible.value = false;
+    MessagePlugin.success('已生成合并词条');
+  } else {
+    // 容量不足或冲突时整笔已撤回，草稿对话框会引导重试，弹窗保留以便核对。
+    MessagePlugin.warning(store.saveStatus.message);
+  }
 };
 </script>
 
